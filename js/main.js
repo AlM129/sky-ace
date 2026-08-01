@@ -1736,10 +1736,16 @@ function setupInputs() {
     document.getElementById('menu-btn-gameover').addEventListener('click', goToMainMenu);
 
     // Launcher redirect
-    const goToLauncher = () => { window.location.href = '../../index.html'; };
-    document.getElementById('launcher-btn-start').addEventListener('click', goToLauncher);
-    document.getElementById('launcher-btn-pause').addEventListener('click', goToLauncher);
-    document.getElementById('launcher-btn-gameover').addEventListener('click', goToLauncher);
+    function returnToLauncher() {
+        if (window.gameHub?.returnToLauncher) {
+            window.gameHub.returnToLauncher();
+        } else {
+            console.warn("Game Hub launcher API unavailable.");
+        }
+    }
+    document.getElementById('launcher-btn-start').addEventListener('click', returnToLauncher);
+    document.getElementById('launcher-btn-pause').addEventListener('click', returnToLauncher);
+    document.getElementById('launcher-btn-gameover').addEventListener('click', returnToLauncher);
 
     // Achievement Modal Open/Close Logic
     const achModal = document.getElementById('achievement-modal');
