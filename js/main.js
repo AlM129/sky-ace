@@ -241,6 +241,46 @@ const SoundManager = {
         osc.stop(time + 0.2);
     },
 
+    rainSource: null,
+    rainGain: null,
+
+    startRain: function () {
+        if (!this.ctx || this.rainSource) return;
+        const bufferSize = this.ctx.sampleRate * 2;
+        const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+
+        this.rainSource = this.ctx.createBufferSource();
+        this.rainSource.buffer = buffer;
+        this.rainSource.loop = true;
+
+        const filter = this.ctx.createBiquadFilter();
+        filter.type = 'bandpass';
+        filter.frequency.value = 3000;
+        filter.Q.value = 0.5;
+
+        this.rainGain = this.ctx.createGain();
+        this.rainGain.gain.value = 0.08;
+
+        this.rainSource.connect(filter);
+        filter.connect(this.rainGain);
+        this.rainGain.connect(this.ctx.destination);
+        this.rainSource.start();
+    },
+
+    stopRain: function () {
+        if (this.rainSource) {
+            try { this.rainSource.stop(); } catch (e) { }
+            this.rainSource.disconnect();
+            this.rainSource = null;
+        }
+        if (this.rainGain) {
+            this.rainGain.disconnect();
+            this.rainGain = null;
+        }
+    },
+
     lowAltTimer: null,
     startLowAltWarning: function () {
         if (this.lowAltTimer) return;
@@ -406,6 +446,23 @@ function unlockAchievement(id) {
     }
 }
 
+// --- GPU Memory Cleanup ---
+function disposeObject(obj) {
+    if (!obj) return;
+    while (obj.children && obj.children.length > 0) {
+        disposeObject(obj.children[0]);
+        obj.remove(obj.children[0]);
+    }
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) {
+        if (Array.isArray(obj.material)) {
+            obj.material.forEach(m => m.dispose());
+        } else {
+            obj.material.dispose();
+        }
+    }
+}
+
 // --- Game Constants & Variables ---
 let scene, camera, renderer;
 let plane, pilotMesh;
@@ -423,6 +480,20 @@ let clouds = [];
 let fallingPilot = null;
 let parachute = null;
 let lavaBombs = []; // v1.2.8 Feature
+
+// Power-up State
+let shieldActive = false;
+let shieldBubble = null;
+let magnetActive = false;
+let magnetTimer = 0;
+let shieldInvincibleTimer = 0;
+
+// Weather State
+let isRaining = false;
+let rainTimer = 0;
+let rainNextToggle = 600 + Math.floor(Math.random() * 600);
+let rainMesh = null;
+const RAIN_COUNT = 500;
 
 // State
 let gameActive = false;
@@ -556,6 +627,7 @@ function init() {
     createStars();
     plane = createPlane();
     scene.add(plane);
+    createRainSystem();
 
     for (let i = 0; i < 30; i++) {
         createCloud((Math.random() - 0.5) * 2000, 100 + Math.random() * 200, -Math.random() * 2000);
@@ -580,6 +652,12 @@ function goToMainMenu() {
     SoundManager.stopEngine();
     SoundManager.stopMusic();
     SoundManager.stopLowAltWarning();
+    SoundManager.stopRain();
+    isRaining = false;
+    if (rainMesh) rainMesh.visible = false;
+    shieldActive = false;
+    if (shieldBubble && plane) { plane.remove(shieldBubble); disposeObject(shieldBubble); shieldBubble = null; }
+    magnetActive = false;
 
     document.getElementById('pause-screen').style.display = 'none';
     document.getElementById('game-over-screen').style.display = 'none';
@@ -587,10 +665,10 @@ function goToMainMenu() {
     document.getElementById('menu-high-score').innerText = "Best Score: " + highScore;
     document.getElementById('start-screen').style.display = 'flex';
 
-    [...explosionParticles].forEach(o => scene.remove(o));
+    [...explosionParticles].forEach(o => { disposeObject(o); scene.remove(o); });
     explosionParticles = [];
 
-    if (plane) scene.remove(plane);
+    if (plane) { disposeObject(plane); scene.remove(plane); }
     plane = createPlane();
     scene.add(plane);
     plane.position.set(0, 100, 0);
@@ -705,6 +783,7 @@ function updateSmoke() {
         p.scale.setScalar(p.userData.life);
         p.material.opacity = p.userData.life * 0.6;
         if (p.userData.life <= 0) {
+            disposeObject(p);
             scene.remove(p);
             smokeParticles.splice(i, 1);
         }
@@ -755,6 +834,7 @@ function updateExplosions() {
         p.scale.setScalar(p.userData.life);
         p.material.opacity = p.userData.life;
         if (p.userData.life <= 0) {
+            disposeObject(p);
             scene.remove(p);
             explosionParticles.splice(i, 1);
         }
@@ -797,6 +877,80 @@ function createParachute(pilot) {
 
     pilot.add(chuteGroup);
     parachute = chuteGroup;
+}
+
+// --- Shield & Magnet Power-up Helpers ---
+function createShieldBubble() {
+    if (shieldBubble) return;
+    const geo = new THREE.SphereGeometry(6, 16, 12);
+    const mat = new THREE.MeshBasicMaterial({
+        color: 0x00ffff,
+        transparent: true,
+        opacity: 0.15,
+        side: THREE.DoubleSide
+    });
+    shieldBubble = new THREE.Mesh(geo, mat);
+    plane.add(shieldBubble);
+}
+
+function destroyShield() {
+    shieldActive = false;
+    shieldInvincibleTimer = 60;
+    if (shieldBubble) {
+        plane.remove(shieldBubble);
+        disposeObject(shieldBubble);
+        shieldBubble = null;
+    }
+    SoundManager.playExplosion();
+    showFloatingMessage("SHIELD BROKEN!");
+}
+
+// --- Rain Particle System ---
+function createRainSystem() {
+    const positions = new Float32Array(RAIN_COUNT * 6);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.LineBasicMaterial({ color: 0xaaccff, transparent: true, opacity: 0.4 });
+    rainMesh = new THREE.LineSegments(geo, mat);
+    rainMesh.visible = false;
+    scene.add(rainMesh);
+}
+
+function updateRain() {
+    rainTimer++;
+    if (rainTimer >= rainNextToggle) {
+        rainTimer = 0;
+        rainNextToggle = 600 + Math.floor(Math.random() * 600);
+        isRaining = !isRaining;
+        if (rainMesh) rainMesh.visible = isRaining;
+        if (isRaining) {
+            SoundManager.startRain();
+        } else {
+            SoundManager.stopRain();
+        }
+    }
+
+    if (isRaining && rainMesh) {
+        const positions = rainMesh.geometry.attributes.position.array;
+        for (let i = 0; i < RAIN_COUNT; i++) {
+            const base = i * 6;
+            positions[base + 1] -= 3 + physics.speed * 0.5;
+            positions[base + 4] -= 3 + physics.speed * 0.5;
+
+            if (positions[base + 1] < physics.y - 100) {
+                const x = physics.x + (Math.random() - 0.5) * 400;
+                const y = physics.y + 50 + Math.random() * 150;
+                const z = physics.z + (Math.random() - 0.5) * 400;
+                positions[base] = x;
+                positions[base + 1] = y;
+                positions[base + 2] = z;
+                positions[base + 3] = x + (Math.random() - 0.5) * 0.5;
+                positions[base + 4] = y - 2 - Math.random() * 2;
+                positions[base + 5] = z + (Math.random() - 0.5) * 0.5;
+            }
+        }
+        rainMesh.geometry.attributes.position.needsUpdate = true;
+    }
 }
 
 function createWorld() {
@@ -967,7 +1121,7 @@ function createBlimp(x, z) {
 // --- Game Logic ---
 
 function resetPlane() {
-    if (plane) scene.remove(plane);
+    if (plane) { disposeObject(plane); scene.remove(plane); }
     plane = createPlane();
     scene.add(plane);
 
@@ -1032,7 +1186,7 @@ function resetPlane() {
         parachute = null;
     }
 
-    [...rings, ...fuelCans, ...obstacles, ...movingObstacles, ...explosionParticles, ...smokeParticles, ...lavaBombs].forEach(o => scene.remove(o));
+    [...rings, ...fuelCans, ...obstacles, ...movingObstacles, ...explosionParticles, ...smokeParticles, ...lavaBombs].forEach(o => { disposeObject(o); scene.remove(o); });
     rings = [];
     fuelCans = [];
     obstacles = [];
@@ -1414,6 +1568,7 @@ function checkCollection(arr, type) {
                         SoundManager.playCollect('normal');
                         showFloatingMessage("RING!");
                     }
+                    disposeObject(item);
                     scene.remove(item);
                     arr.splice(i, 1);
                 } else if (type === 'fuel') {
@@ -1424,6 +1579,7 @@ function checkCollection(arr, type) {
 
                     SoundManager.playCollect('normal');
                     showFloatingMessage("REFUELED");
+                    disposeObject(item);
                     scene.remove(item);
                     arr.splice(i, 1);
                 }
@@ -1450,6 +1606,7 @@ function checkCollection(arr, type) {
         }
 
         if (despawn) {
+            disposeObject(item);
             scene.remove(item);
             arr.splice(i, 1);
         }
@@ -1632,6 +1789,7 @@ function updateLavaBombs() {
 
         // Remove if it falls below the ground
         if (p.position.y < -10) {
+            disposeObject(p);
             scene.remove(p);
             lavaBombs.splice(i, 1);
         }
